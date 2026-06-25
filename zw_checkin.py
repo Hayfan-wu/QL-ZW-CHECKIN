@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 3.0.0
+@Version      : 3.1.0
 
 环境变量:
   ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -25,6 +25,12 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v3.1.0:
+  - 修复登录跳转URL解码问题（需要两次 decodeURIComponent）
+  - 增加授权码获取容错处理
+  - 优化b2_token获取方式（支持直接使用access_token）
+  - 改进Selenium模式错误处理
 
 更新日志 v3.0.0:
   - 修复API登录模式，使用正确的 /Account/UserLogin 接口
@@ -441,26 +447,38 @@ class ZwCheckinAPI:
                 log_info("登录成功，正在获取授权码...")
                 
                 # msg是跳转URL，需要访问它来获取授权码
-                redirect_url = msg if isinstance(msg, str) else msg.get('value', '')
+                # 注意：根据JS代码，需要两次 decodeURIComponent 解码
+                redirect_url_raw = msg if isinstance(msg, str) else msg.get('value', '')
                 
-                if not redirect_url:
+                if not redirect_url_raw:
                     log_error("登录成功但未获取到跳转URL")
                     return False
+                
+                # 两次URL解码（与JS的 decodeURIComponent(decodeURIComponent(x.msg)) 对应）
+                try:
+                    redirect_url = urllib.parse.unquote(urllib.parse.unquote(redirect_url_raw))
+                except Exception:
+                    redirect_url = redirect_url_raw
+                
+                log_debug(f"原始跳转URL: {redirect_url_raw[:80]}...")
+                log_debug(f"解码后跳转URL: {redirect_url[:100]}...")
                 
                 # 如果URL是相对路径，补全
                 if redirect_url.startswith('/'):
                     redirect_url = f'https://accounts.zwsoft.cn{redirect_url}'
                 
-                log_debug(f"跳转URL: {redirect_url[:100]}...")
+                log_debug(f"最终跳转URL: {redirect_url[:100]}...")
                 
                 # 访问跳转URL（会经过多次重定向，最终到callback页面）
+                # 使用 history 跟踪重定向链
                 callback_response = self.session.get(
                     redirect_url,
                     allow_redirects=True,
                     timeout=30
                 )
                 
-                log_debug(f"最终URL: {callback_response.url[:100]}...")
+                log_debug(f"最终URL: {callback_response.url[:150]}...")
+                log_debug(f"当前Cookies: {list(self.session.cookies.keys())}")
                 
                 # 7. 检查是否跳转到了callback页面
                 if 'zwforumchild/login.php' in callback_response.url:
@@ -478,7 +496,7 @@ class ZwCheckinAPI:
                         return self._exchange_token(code)
                     else:
                         log_error("登录失败：未获取到授权码")
-                        log_debug(f"回调URL参数: {query_params}")
+                        log_debug(f"回调URL参数: {list(query_params.keys())}")
                         return False
                 else:
                     # 检查是否已经有b2_token cookie
@@ -488,8 +506,17 @@ class ZwCheckinAPI:
                         log_info("登录成功（获取到 b2_token）")
                         return True
                     
+                    # 检查最终URL中是否有code参数（可能路径不同但有code）
+                    if 'code=' in callback_response.url:
+                        parsed = urllib.parse.urlparse(callback_response.url)
+                        query_params = urllib.parse.parse_qs(parsed.query)
+                        code = query_params.get('code', [''])[0]
+                        if code:
+                            log_debug(f"从最终URL中获取到授权码: {code[:20]}...")
+                            return self._exchange_token(code)
+                    
                     log_error(f"登录失败：未跳转到预期的回调页面")
-                    log_debug(f"当前URL: {callback_response.url[:100]}")
+                    log_debug(f"当前URL: {callback_response.url[:150]}")
                     return False
             
             # status=0: 登录失败
@@ -550,7 +577,7 @@ class ZwCheckinAPI:
     
     def _exchange_token(self, code):
         """
-        用授权码换取 access token
+        用授权码换取 access token，并获取论坛 b2_token
         
         Args:
             code: 授权码
@@ -579,10 +606,10 @@ class ZwCheckinAPI:
             
             if token_response.status_code == 200:
                 token_result = token_response.json()
-                log_debug(f"Token响应: access_token={token_result.get('access_token', '')[:20]}...")
+                access_token = token_result.get('access_token', '')
+                log_debug(f"Token响应: access_token={access_token[:20]}...")
                 
-                # 访问回调页面，获取 b2_token cookie
-                # 先检查当前是否已有b2_token
+                # 先检查当前是否已有b2_token cookie
                 b2_token_cookie = self.session.cookies.get('b2_token')
                 
                 if b2_token_cookie:
@@ -590,21 +617,56 @@ class ZwCheckinAPI:
                     log_info("登录成功（获取到 b2_token）")
                     log_debug(f"b2_token: {self.b2_token[:20]}...")
                     return True
-                else:
-                    # 尝试手动访问回调页面来设置 cookie
-                    log_debug("未找到 b2_token cookie，尝试手动访问回调页面...")
-                    callback_url = f'{LOGIN_CALLBACK}?code={code}&state={self.state}'
-                    callback_response = self.session.get(callback_url, allow_redirects=True, timeout=30)
+                
+                # 尝试手动访问回调页面来设置 cookie
+                log_debug("未找到 b2_token cookie，尝试手动访问回调页面...")
+                
+                # 方法1: 访问带code和state的回调URL
+                callback_url = f'{LOGIN_CALLBACK}?code={code}&state={self.state}'
+                callback_response = self.session.get(callback_url, allow_redirects=True, timeout=30)
+                
+                b2_token_cookie = self.session.cookies.get('b2_token')
+                if b2_token_cookie:
+                    self.b2_token = b2_token_cookie
+                    log_info("登录成功（获取到 b2_token）")
+                    return True
+                
+                log_debug(f"方法1失败，当前cookies: {list(self.session.cookies.keys())}")
+                
+                # 方法2: 尝试用 access_token 调用论坛接口
+                if access_token:
+                    log_debug("尝试用 access_token 获取用户信息...")
                     
-                    b2_token_cookie = self.session.cookies.get('b2_token')
-                    if b2_token_cookie:
-                        self.b2_token = b2_token_cookie
-                        log_info("登录成功（获取到 b2_token）")
-                        return True
-                    else:
-                        log_error("登录失败：未获取到 b2_token")
-                        log_debug(f"所有cookies: {dict(self.session.cookies)}")
-                        return False
+                    # 尝试用 access_token 访问论坛的用户接口
+                    test_headers = {
+                        'Authorization': f'Bearer {access_token}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    # 尝试获取用户信息
+                    test_response = self.session.post(
+                        USER_MISSION_URL,
+                        headers=test_headers,
+                        json={},
+                        timeout=30
+                    )
+                    
+                    log_debug(f"测试访问响应: {test_response.status_code}")
+                    
+                    # 如果返回200，说明access_token可以直接用
+                    if test_response.status_code == 200:
+                        # 检查返回的数据是否有效
+                        test_data = test_response.json()
+                        mission = test_data.get('mission', {})
+                        if mission.get('current_user', 0) > 0:
+                            log_info("登录成功（access_token可直接用于API）")
+                            # 保存 access_token 作为 b2_token 使用
+                            self.b2_token = access_token
+                            return True
+                
+                log_error("登录失败：未获取到 b2_token")
+                log_debug(f"所有cookies: {list(self.session.cookies.keys())}")
+                return False
             else:
                 log_error(f"换取Token失败: {token_response.status_code}")
                 log_debug(f"Token响应内容: {token_response.text[:500]}")
@@ -612,6 +674,9 @@ class ZwCheckinAPI:
                 
         except Exception as e:
             log_error(f"换取Token异常: {e}")
+            if DEBUG:
+                import traceback
+                traceback.print_exc()
             return False
     
     def get_mission_status(self):
@@ -846,15 +911,35 @@ def checkin_selenium(username, password):
         chrome_options.add_argument('--window-size=1920,1080')
         chrome_options.add_argument('--disable-blink-features=AutomationControlled')
         
+        driver = None
+        
+        # 尝试多种方式启动Chrome
         try:
+            # 方法1: 使用 webdriver-manager 自动管理
             from webdriver_manager.chrome import ChromeDriverManager
             from selenium.webdriver.chrome.service import Service
             driver = webdriver.Chrome(
                 service=Service(ChromeDriverManager().install()),
                 options=chrome_options
             )
-        except Exception:
-            driver = webdriver.Chrome(options=chrome_options)
+        except Exception as e1:
+            log_debug(f"webdriver-manager方式失败: {e1}")
+            try:
+                # 方法2: 直接使用系统ChromeDriver
+                driver = webdriver.Chrome(options=chrome_options)
+            except Exception as e2:
+                log_debug(f"直接启动Chrome失败: {e2}")
+                # 都失败了，返回错误
+                error_msg = f"无法启动Chrome浏览器: {str(e2)[:100]}"
+                log_error(error_msg)
+                log_error("请确保已安装Chrome浏览器和ChromeDriver")
+                return {
+                    'success': False,
+                    'message': error_msg,
+                    'consecutive_days': 0,
+                    'points_earned': 0,
+                    'total_points': 0
+                }
         
         driver.implicitly_wait(10)
         
@@ -1086,7 +1171,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v3.0.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v3.1.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
