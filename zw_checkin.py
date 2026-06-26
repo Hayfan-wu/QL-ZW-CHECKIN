@@ -4,14 +4,16 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 6.1.0
+@Version      : 6.2.0
 
 环境变量:
-  ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
-  ZWSOFT_PASSWORD  - 中望社区密码，多账号用换行或&分隔（与账号一一对应）
-  ZWSOFT_NOTIFY    - 通知级别，0=关闭 1=仅异常 2=全部通知（默认1）
-  ZWSOFT_DEBUG     - 调试模式，true/false（默认false）
-  ZWSOFT_MODE      - 运行模式，api=纯API模式 selenium=浏览器模式 auto=自动尝试（默认auto）
+  ZWSOFT_USERNAME     - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
+  ZWSOFT_PASSWORD     - 中望社区密码，多账号用换行或&分隔（与账号一一对应）
+  ZWSOFT_NOTIFY       - 通知级别，0=关闭 1=仅异常 2=全部通知（默认1）
+  ZWSOFT_DEBUG        - 调试模式，true/false（默认false）
+  ZWSOFT_MODE         - 运行模式，api=纯API模式 selenium=浏览器模式 auto=自动尝试（默认auto）
+  WXPUSHER_APP_TOKEN  - WXPusher应用Token（可选，用于微信推送）
+  WXPUSHER_UIDS       - WXPusher接收者UID，多个用逗号分隔（可选）
 
 依赖库:
   requests>=2.28.0
@@ -25,6 +27,12 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v6.2.0:
+  - 新增 WXPusher 微信推送支持（配置 WXPUSHER_APP_TOKEN 和 WXPUSHER_UIDS）
+  - 优化通知格式，与用户期望的展示样式一致
+  - 新增账号脱敏显示（保护隐私）
+  - 通知内容展示签到后的实际数据（连续天数、积分等）
 
 更新日志 v6.1.0:
   - 修复签到接口请求格式，改为 form-urlencoded 与前端一致
@@ -81,6 +89,10 @@ ENV_NOTIFY = 'ZWSOFT_NOTIFY'
 ENV_DEBUG = 'ZWSOFT_DEBUG'
 ENV_MODE = 'ZWSOFT_MODE'
 
+# WXPusher 推送配置
+ENV_WXPUSHER_APP_TOKEN = 'WXPUSHER_APP_TOKEN'
+ENV_WXPUSHER_UIDS = 'WXPUSHER_UIDS'
+
 # 中望社区URL配置
 PUBKEY_URL = 'https://accounts.zwsoft.cn/Common/Getpubkeys'
 FORUM_BASE = 'https://forum.zwsoft.cn'
@@ -103,6 +115,62 @@ NOTIFY_LEVEL = int(os.getenv(ENV_NOTIFY, '1'))
 DEBUG = os.getenv(ENV_DEBUG, 'false').lower() == 'true'
 RUN_MODE = os.getenv(ENV_MODE, 'auto').lower()
 
+# WXPusher 配置
+WXPUSHER_APP_TOKEN = os.getenv(ENV_WXPUSHER_APP_TOKEN, '').strip()
+WXPUSHER_UIDS = os.getenv(ENV_WXPUSHER_UIDS, '').strip()
+HAS_WXPUSHER = bool(WXPUSHER_APP_TOKEN and WXPUSHER_UIDS)
+
+
+def wxpusher_push(title, content):
+    """
+    使用WXPusher推送消息
+    
+    Args:
+        title: 消息标题
+        content: 消息内容（支持HTML）
+    
+    Returns:
+        bool: 是否推送成功
+    """
+    if not HAS_WXPUSHER:
+        return False
+    
+    try:
+        # 解析UID列表（支持逗号、换行、空格分隔）
+        import re
+        uids = [uid.strip() for uid in re.split(r'[,，\n\s]+', WXPUSHER_UIDS) if uid.strip()]
+        
+        if not uids:
+            log_error("WXPusher UID列表为空")
+            return False
+        
+        url = 'https://wxpusher.zjiecode.com/api/send/message'
+        
+        # 构建HTML内容
+        html_content = f"<h3>{title}</h3>\n"
+        html_content += content.replace('\n', '<br/>\n')
+        
+        data = {
+            'appToken': WXPUSHER_APP_TOKEN,
+            'content': html_content,
+            'contentType': 2,  # 2=HTML
+            'uids': uids,
+        }
+        
+        resp = requests.post(url, json=data, timeout=30)
+        result = resp.json()
+        
+        if result.get('code') == 1000:
+            log_debug(f"WXPusher推送成功")
+            return True
+        else:
+            log_error(f"WXPusher推送失败: {result.get('msg', '未知错误')}")
+            return False
+            
+    except Exception as e:
+        log_error(f"WXPusher推送异常: {e}")
+        return False
+
 
 def log_debug(msg):
     """调试日志"""
@@ -120,9 +188,41 @@ def log_error(msg):
     print(f"[ERROR] {msg}")
 
 
+def mask_username(username):
+    """
+    脱敏显示用户名/手机号
+    
+    Args:
+        username: 原始用户名
+    
+    Returns:
+        str: 脱敏后的用户名
+    """
+    if not username:
+        return '***'
+    
+    # 手机号脱敏
+    if len(username) == 11 and username.isdigit():
+        return username[:3] + '****' + username[7:]
+    
+    # 邮箱脱敏
+    if '@' in username:
+        name, domain = username.split('@', 1)
+        if len(name) <= 2:
+            return name[0] + '***@' + domain
+        else:
+            return name[:2] + '***@' + domain
+    
+    # 其他情况，中间脱敏
+    if len(username) <= 2:
+        return username + '***'
+    else:
+        return username[:1] + '****' + username[-1:]
+
+
 def notify(title, content, level=1):
     """
-    发送通知
+    发送通知（青龙通知 + WXPusher）
     
     Args:
         title: 通知标题
@@ -135,11 +235,20 @@ def notify(title, content, level=1):
     print(f"{content}")
     print(f"{'='*50}\n")
     
-    if HAS_NOTIFY and NOTIFY_LEVEL >= level:
-        try:
-            ql_send(title, content)
-        except Exception as e:
-            log_error(f"发送通知失败: {e}")
+    if NOTIFY_LEVEL >= level:
+        # 青龙面板通知
+        if HAS_NOTIFY:
+            try:
+                ql_send(title, content)
+            except Exception as e:
+                log_error(f"青龙通知失败: {e}")
+        
+        # WXPusher 推送
+        if HAS_WXPUSHER:
+            try:
+                wxpusher_push(title, content)
+            except Exception as e:
+                log_error(f"WXPusher推送失败: {e}")
 
 
 # ==================== 账号读取 ====================
@@ -922,7 +1031,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v6.0.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v6.2.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
@@ -966,24 +1075,40 @@ def main():
         # 有失败，发送异常通知
         title = f"⚠️ 中望签到 - {fail_count}个账号失败"
         content = f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"成功: {success_count} 个\n"
-        content += f"失败: {fail_count} 个\n\n"
+        content += f"成功: {success_count} 个 | 失败: {fail_count} 个\n"
+        content += f"耗时: {duration:.1f} 秒\n\n"
         
         for item in results:
-            status = "✅" if item['result'].get('success') else "❌"
-            content += f"{status} {item['username']}: {item['result'].get('message', '')}\n"
+            r = item['result']
+            masked_name = mask_username(item['username'])
+            if r.get('success'):
+                content += f"✅ 签到成功！\n"
+                content += f"   账号：{masked_name}\n"
+                content += f"   连续签到: {r.get('consecutive_days', 0)} 天\n"
+                content += f"   获得积分: {r.get('points_earned', 0)}\n"
+                content += f"   总积分: {r.get('total_points', 0)}\n\n"
+            else:
+                content += f"❌ 签到失败\n"
+                content += f"   账号：{masked_name}\n"
+                content += f"   原因: {r.get('message', '未知错误')}\n\n"
         
         notify(title, content, level=1)
     elif NOTIFY_LEVEL >= 2:
         # 全部成功，且通知级别>=2，发送成功通知
         title = f"✅ 中望签到 - 全部成功"
-        content = f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"成功: {success_count} 个\n"
-        content += f"耗时: {duration:.1f} 秒\n\n"
         
+        content = ""
         for item in results:
             r = item['result']
-            content += f"✅ {item['username']}: 连续{r.get('consecutive_days', 0)}天, 总积分{r.get('total_points', 0)}\n"
+            masked_name = mask_username(item['username'])
+            content += f"✅ 签到成功！\n"
+            content += f"   账号：{masked_name}\n"
+            content += f"   连续签到: {r.get('consecutive_days', 0)} 天\n"
+            content += f"   获得积分: {r.get('points_earned', 0)}\n"
+            content += f"   总积分: {r.get('total_points', 0)}\n\n"
+        
+        content += f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        content += f"成功: {success_count} 个 | 耗时: {duration:.1f} 秒"
         
         notify(title, content, level=2)
 
