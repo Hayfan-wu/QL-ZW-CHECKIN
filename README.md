@@ -4,6 +4,11 @@
 
 ## 📋 更新日志
 
+### v6.4.0 (2025-06-26)
+- 🔧 **修复重复推送问题**：配置 WXPusher 后自动禁用青龙面板通知，避免同时收到两条相同消息
+- ⚙️ **新增 `ZWSOFT_QL_NOTIFY` 环境变量**：可手动控制是否启用青龙通知（true/false）
+- 🎯 **智能默认策略**：配置了 WXPusher 则只用 WXPusher 推送，未配置则用青龙通知
+
 ### v6.3.0 (2025-06-26)
 - 🐛 **修复连续签到天数显示错误**：改为使用 `mission.always` 字段（前端显示"连续签到：XX天"）
 - 🔍 **澄清字段含义**：`tk.days` 是"未签到天数"（用于填坑功能），不是连续签到天数
@@ -89,6 +94,7 @@ ql repo https://github.com/Hayfan-wu/QL-ZW-CHECKIN.git "zw_" "" "" "main"
 | `ZWSOFT_NOTIFY` | 通知级别：0=关闭 1=仅异常 2=全部通知（默认1） | ❌ |
 | `ZWSOFT_DEBUG` | 调试模式：true/false（默认false） | ❌ |
 | `ZWSOFT_MODE` | 运行模式：api/selenium/auto（默认auto） | ❌ |
+| `ZWSOFT_QL_NOTIFY` | 是否启用青龙面板通知：true/false（默认：配置WXPusher后自动禁用） | ❌ |
 | `WXPUSHER_APP_TOKEN` | WXPusher 应用 Token（微信推送，可选） | ❌ |
 | `WXPUSHER_UIDS` | WXPusher 接收者 UID，多个用逗号分隔（可选） | ❌ |
 
@@ -183,6 +189,10 @@ ZWSOFT_MODE=selenium
    获得积分: 31
    总积分: 508
 ```
+
+> 💡 **提示**：配置 WXPusher 后，脚本会**自动禁用青龙面板通知**，避免同时收到两条相同的推送消息。
+> 
+> 如需同时启用两种通知方式，可添加环境变量 `ZWSOFT_QL_NOTIFY=true`。
 
 ### 通知级别控制
 
