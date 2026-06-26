@@ -4,12 +4,17 @@
 
 ## 📋 更新日志
 
-### v4.0.0 (2025-06-26)
-- 🔄 **完全重构登录逻辑**：采用模拟浏览器表单提交方式
-- 🎯 **简化流程**：论坛首页→授权→登录表单提交→跟随重定向→验证登录
-- 🔑 **PKCE参数一致**：避免之前AJAX登录导致的token无效问题
-- ✅ **统一验证机制**：所有登录方式都经过API验证，确保真的登录成功
-- 📦 **优化代码结构**：从1484行精简到975行，提高可维护性
+### v6.3.0 (2025-06-26)
+- 🐛 **修复连续签到天数显示错误**：改为使用 `mission.always` 字段（前端显示"连续签到：XX天"）
+- 🔍 **澄清字段含义**：`tk.days` 是"未签到天数"（用于填坑功能），不是连续签到天数
+- 🚀 **增强 WXPusher 推送**：添加 SSL 错误自动降级、详细调试日志
+- 🎨 **优化 WXPusher HTML 通知格式**：更美观易读
+
+### v6.2.0 (2025-06-26)
+- ✨ **新增 WXPusher 微信推送支持**：配置 `WXPUSHER_APP_TOKEN` 和 `WXPUSHER_UIDS`
+- 🎨 **优化通知格式**：与用户期望的展示样式一致
+- 🔒 **新增账号脱敏显示**：保护隐私
+- 📊 **通知内容展示签到后的实际数据**：连续天数、积分等
 
 ### v3.5.0 (2025-06-26)
 - ✅ **增加token有效性验证**：避免使用无效的b2_token
@@ -83,7 +88,9 @@ ql repo https://github.com/Hayfan-wu/QL-ZW-CHECKIN.git "zw_" "" "" "main"
 | `ZWSOFT_PASSWORD` | 中望社区密码，多账号换行分隔（与账号一一对应） | ✅ |
 | `ZWSOFT_NOTIFY` | 通知级别：0=关闭 1=仅异常 2=全部通知（默认1） | ❌ |
 | `ZWSOFT_DEBUG` | 调试模式：true/false（默认false） | ❌ |
-| `ZWSOFT_MODE` | 运行模式：api/selenium（默认api） | ❌ |
+| `ZWSOFT_MODE` | 运行模式：api/selenium/auto（默认auto） | ❌ |
+| `WXPUSHER_APP_TOKEN` | WXPusher 应用 Token（微信推送，可选） | ❌ |
+| `WXPUSHER_UIDS` | WXPusher 接收者 UID，多个用逗号分隔（可选） | ❌ |
 
 ### 多账号配置示例
 
@@ -138,6 +145,8 @@ ZWSOFT_MODE=selenium
 
 ## 🔔 通知推送
 
+### 方式一：青龙面板通知（推荐）
+
 脚本内置青龙面板通知模块，支持以下推送渠道（在青龙面板配置文件中设置）：
 
 - Server酱
@@ -149,6 +158,31 @@ ZWSOFT_MODE=selenium
 - 飞书机器人
 - iGot
 - WxPusher
+
+### 方式二：WXPusher 微信推送（独立配置）
+
+如果不想配置青龙全局通知，也可以直接通过环境变量配置 WXPusher：
+
+**配置步骤：**
+
+1. 访问 [WXPusher 官网](https://wxpusher.zjiecode.com/) 注册账号
+2. 创建应用，获取 `APP_TOKEN`
+3. 关注应用的公众号，获取你的 `UID`
+4. 在青龙面板环境变量中添加：
+
+| 变量名 | 说明 | 示例 |
+|--------|------|------|
+| `WXPUSHER_APP_TOKEN` | 应用 Token | `AT_xxx...` |
+| `WXPUSHER_UIDS` | 接收者 UID，多个用逗号分隔 | `UID_xxx,UID_yyy` |
+
+**通知效果：**
+```
+✅ 签到成功！
+   账号：138****4746
+   连续签到: 41 天
+   获得积分: 31
+   总积分: 508
+```
 
 ### 通知级别控制
 
