@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 4.0.0
+@Version      : 6.1.0
 
 环境变量:
   ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -26,6 +26,27 @@ cron: 0 0 1 * * *
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
 
+更新日志 v6.1.0:
+  - 修复签到接口请求格式，改为 form-urlencoded 与前端一致
+  - 修复签到状态判断逻辑，使用 credit 字段判断是否已签到
+  - 修复签到响应解析，兼容字符串和 JSON 两种返回格式
+  - 优化连续签到天数读取（从 tk.days 字段获取）
+
+更新日志 v6.0.0:
+  - 重大修复：登录流程完全重构，解决了两种模式都报错的问题
+  - 核心发现：PKCE参数必须由论坛生成，不能自己构造授权URL
+  - 正确入口：从论坛 login.php 发起授权（它会自己生成 code_verifier）
+  - 登录方式：AJAX POST 到 /Account/UserLogin，JSON响应 status=1 表示成功
+  - 回调处理：登录成功后跟随重定向，login.php 自动用 code 换 token
+  - 验证方式：b2_token cookie + Authorization Bearer 头，current_user > 0 表示登录成功
+  - 大幅提升登录成功率
+
+更新日志 v5.0.0:
+  - 修复核心登录逻辑：从普通表单提交改为AJAX方式提交到 /Account/UserLogin
+  - 正确处理登录响应：JSON格式返回，status=1表示成功，msg为重定向URL
+  - 增加AJAX请求头：X-Requested-With、正确的Content-Type
+  - 优化登录流程，更贴近真实浏览器行为
+
 更新日志 v4.0.0:
   - 完全重构登录逻辑，采用模拟浏览器表单提交方式
   - 简化流程：从论坛首页→授权→登录表单提交→跟随重定向→验证登录
@@ -40,8 +61,6 @@ import re
 import time
 import json
 import base64
-import hashlib
-import secrets
 import urllib.parse
 import requests
 from datetime import datetime
@@ -63,17 +82,14 @@ ENV_DEBUG = 'ZWSOFT_DEBUG'
 ENV_MODE = 'ZWSOFT_MODE'
 
 # 中望社区URL配置
-AUTHORIZE_URL = 'https://accounts.zwsoft.cn/connect/authorize'
 PUBKEY_URL = 'https://accounts.zwsoft.cn/Common/Getpubkeys'
 FORUM_BASE = 'https://forum.zwsoft.cn'
 FORUM_REST = f'{FORUM_BASE}/wp-json/b2/v1'
 CHECKIN_URL = f'{FORUM_REST}/userMission'
 USER_MISSION_URL = f'{FORUM_REST}/getUserMission'
-LOGIN_CALLBACK = f'{FORUM_BASE}/wp-content/themes/zwforumchild/login.php'
-
-# 客户端配置
-CLIENT_ID = 'Client_zw_tech_forum'
-SCOPE = 'openid email phone profile offline_access ZMS.UserDetails.Write ZMS.UserDetails.Read'
+LOGIN_PHP = f'{FORUM_BASE}/wp-content/themes/zwforumchild/login.php'
+LOGIN_API = 'https://accounts.zwsoft.cn/Account/UserLogin'
+ACCOUNTS_BASE = 'https://accounts.zwsoft.cn'
 
 # ==================== 通知模块 ====================
 
@@ -176,41 +192,31 @@ def get_accounts():
 
 # ==================== 工具函数 ====================
 
-def generate_code_verifier():
-    """生成 PKCE code_verifier"""
-    return secrets.token_urlsafe(64)
-
-
-def generate_code_challenge(verifier):
-    """生成 PKCE code_challenge (S256)"""
-    code_challenge = hashlib.sha256(verifier.encode('ascii')).digest()
-    return base64.urlsafe_b64encode(code_challenge).rstrip(b'=').decode('ascii')
-
-
-def generate_state():
-    """生成 state 参数"""
-    return secrets.token_hex(16)
-
-
-def rsa_encrypt(public_key_pem, plaintext):
+def rsa_encrypt(public_key_str, plaintext):
     """
     RSA加密，与JSEncrypt兼容（PKCS1_v1_5填充）
     
     Args:
-        public_key_pem: 公钥（PEM格式或裸base64）
+        public_key_str: 公钥字符串（PEM格式，从JSON解析后）
         plaintext: 要加密的明文
     
     Returns:
         str: base64编码的密文
     """
-    if not public_key_pem.startswith('-----BEGIN'):
-        public_key_pem = f'-----BEGIN PUBLIC KEY-----\n{public_key_pem}\n-----END PUBLIC KEY-----'
+    # 提取base64部分
+    match = re.search(r'-----BEGIN PUBLIC KEY-----(.+?)-----END PUBLIC KEY-----', 
+                     public_key_str, re.DOTALL)
+    if match:
+        b64part = match.group(1).replace('\r', '').replace('\n', '').strip()
+    else:
+        b64part = public_key_str.strip()
     
-    public_key = RSA.import_key(public_key_pem)
+    # 解码为DER格式导入
+    der_bytes = base64.b64decode(b64part)
+    public_key = RSA.import_key(der_bytes)
+    
     cipher = PKCS1_v1_5.new(public_key)
-    
-    # 分段加密（JSEncrypt使用117字节的块大小）
-    max_block_size = 117
+    max_block_size = 117  # 2048位密钥 = 256字节, PKCS1_v1_5填充占11字节
     plaintext_bytes = plaintext.encode('utf-8')
     
     encrypted_blocks = []
@@ -226,28 +232,27 @@ def rsa_encrypt(public_key_pem, plaintext):
 # ==================== API 模式核心类 ====================
 
 class ZwCheckinAPI:
-    """中望社区签到 - API模式（模拟浏览器表单提交）
+    """中望社区签到 - API模式（模拟浏览器AJAX登录）
     
-    登录流程：
-    1. 访问论坛首页
-    2. 发起OAuth2授权请求（带PKCE参数），跳转到IdentityServer登录页
-    3. 获取RSA公钥，加密密码
-    4. 普通表单POST提交登录
-    5. 跟随所有重定向回到论坛
-    6. 验证登录状态
+    登录流程（v6.0 正确流程）：
+    1. 访问论坛 login.php，触发授权重定向（论坛自己生成PKCE参数）
+    2. 获取RSA公钥，加密密码
+    3. AJAX POST 到 /Account/UserLogin 提交登录
+    4. 登录成功返回 JSON {status:1, msg: 授权回调URL（相对路径）}
+    5. 访问授权回调URL，IdentityServer生成code并重定向回论坛login.php
+    6. 论坛login.php用code+自己保存的code_verifier换取token
+    7. 论坛设置 b2_token 等登录cookie
+    8. 验证登录状态（current_user > 0）
     """
     
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.b2_token = None  # 论坛JWT token 或 '__cookie_mode__'
+        self.b2_token = None  # 论坛JWT token
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         })
-        self.code_verifier = None
-        self.code_challenge = None
-        self.state = None
         self.public_key = None
     
     def _get_public_key(self):
@@ -256,9 +261,13 @@ class ZwCheckinAPI:
         try:
             response = self.session.get(PUBKEY_URL, timeout=30)
             if response.status_code == 200:
-                key = response.text.strip().strip('"')
+                # 接口返回的是JSON字符串
+                try:
+                    key = response.json()
+                except:
+                    key = response.text.strip().strip('"')
                 self.public_key = key
-                log_debug(f"公钥获取成功: {key[:50]}...")
+                log_debug(f"公钥获取成功")
                 return True
             log_error(f"获取公钥失败: HTTP {response.status_code}")
             return False
@@ -282,7 +291,8 @@ class ZwCheckinAPI:
             try:
                 headers = {
                     'Authorization': f'Bearer {b2_token_cookie}',
-                    'Content-Type': 'application/json'
+                    'Content-Type': 'application/json',
+                    'Referer': FORUM_BASE + '/'
                 }
                 response = self.session.post(
                     USER_MISSION_URL, headers=headers, json={}, timeout=30
@@ -292,7 +302,7 @@ class ZwCheckinAPI:
                     mission = data.get('mission', {})
                     if mission.get('current_user', 0) > 0:
                         self.b2_token = b2_token_cookie
-                        log_info("登录成功（b2_token cookie有效）")
+                        log_info("登录成功（b2_token有效）")
                         return True
             except Exception as e:
                 log_debug(f"b2_token验证异常: {e}")
@@ -324,7 +334,7 @@ class ZwCheckinAPI:
     
     def login(self):
         """
-        模拟浏览器登录（表单提交方式）
+        模拟浏览器登录（AJAX方式提交，与UserLogin.js一致）
         
         Returns:
             bool: 是否登录成功
@@ -337,48 +347,30 @@ class ZwCheckinAPI:
             return False
         
         try:
-            # 步骤1：访问论坛首页，建立会话
-            log_debug("步骤1：访问论坛首页...")
-            self.session.get(FORUM_BASE, timeout=30)
-            log_debug(f"当前Cookies: {list(self.session.cookies.keys())}")
-            
-            # 步骤2：生成PKCE参数，发起授权请求
-            log_debug("步骤2：发起OAuth2授权请求...")
-            self.code_verifier = generate_code_verifier()
-            self.code_challenge = generate_code_challenge(self.code_verifier)
-            self.state = generate_state()
-            
-            auth_params = {
-                'response_type': 'code',
-                'client_id': CLIENT_ID,
-                'scope': SCOPE,
-                'redirect_uri': LOGIN_CALLBACK,
-                'state': self.state,
-                'code_challenge': self.code_challenge,
-                'code_challenge_method': 'S256',
-                'token': f'login_time_{int(time.time())}'
-            }
-            
-            auth_url = f'{AUTHORIZE_URL}?{urllib.parse.urlencode(auth_params)}'
-            log_debug(f"授权URL: {auth_url[:100]}...")
-            
-            login_page_resp = self.session.get(auth_url, allow_redirects=True, timeout=30)
+            # 步骤1：访问论坛login.php，触发授权重定向（论坛生成PKCE）
+            log_debug("步骤1：访问论坛login.php，触发授权重定向...")
+            login_page_resp = self.session.get(LOGIN_PHP, allow_redirects=True, timeout=30)
             log_debug(f"登录页URL: {login_page_resp.url[:100]}...")
             log_debug(f"登录页状态码: {login_page_resp.status_code}")
             
-            # 检查是否已经登录了（直接跳转到回调）
-            if 'zwforumchild/login.php' in login_page_resp.url:
+            # 检查是否已经登录了（直接跳转到首页）
+            if login_page_resp.url == FORUM_BASE + '/' or login_page_resp.url == FORUM_BASE:
                 log_debug("已登录状态，直接验证...")
                 if self._verify_login():
                     return True
             
-            # 步骤3：获取RSA公钥
-            log_debug("步骤3：获取RSA公钥...")
+            # 确保在IdentityServer登录页
+            if 'accounts.zwsoft.cn' not in login_page_resp.url:
+                log_error(f"未重定向到授权服务器，当前URL: {login_page_resp.url[:80]}")
+                return False
+            
+            # 步骤2：获取RSA公钥
+            log_debug("步骤2：获取RSA公钥...")
             if not self._get_public_key():
                 return False
             
-            # 步骤4：从登录页提取表单参数
-            log_debug("步骤4：提取登录页表单参数...")
+            # 步骤3：从登录页提取表单参数
+            log_debug("步骤3：提取登录页表单参数...")
             page_html = login_page_resp.text
             
             token_match = re.search(r'name="__RequestVerificationToken"[^>]*value="([^"]+)"', page_html)
@@ -394,9 +386,9 @@ class ZwCheckinAPI:
                 return_url = query_params.get('ReturnUrl', [''])[0]
             
             client_match = re.search(r'name="ClientId"[^>]*value="([^"]+)"', page_html)
-            client_id = client_match.group(1) if client_match else CLIENT_ID
+            client_id = client_match.group(1) if client_match else 'Client_zw_tech_forum'
             
-            log_debug(f"RequestVerificationToken: {request_token[:20]}..." if request_token else "未找到RequestVerificationToken")
+            log_debug(f"RequestVerificationToken: {'✓' if request_token else '✗'}")
             log_debug(f"ReturnUrl: {return_url[:50]}..." if return_url else "未找到ReturnUrl")
             log_debug(f"ClientId: {client_id}")
             
@@ -404,13 +396,13 @@ class ZwCheckinAPI:
                 log_error("未能从登录页面提取到RequestVerificationToken")
                 return False
             
-            # 步骤5：加密密码
-            log_debug("步骤5：加密密码...")
+            # 步骤4：加密密码
+            log_debug("步骤4：加密密码...")
             encrypted_password = rsa_encrypt(self.public_key, self.password)
-            log_debug(f"密码加密成功: {encrypted_password[:20]}...")
+            log_debug("密码加密成功")
             
-            # 步骤6：表单提交登录
-            log_debug("步骤6：提交登录表单...")
+            # 步骤5：AJAX方式提交登录（与UserLogin.js一致）
+            log_debug("步骤5：AJAX提交登录...")
             
             login_data = {
                 'Agreement': 'true',
@@ -423,34 +415,69 @@ class ZwCheckinAPI:
                 'ActUser': '',
                 'ActCorp': '',
                 '__RequestVerificationToken': request_token,
-                'button': 'login'
             }
             
-            # 查找页面中的checkbox，全部勾选
-            checkbox_matches = re.findall(r'<input[^>]*type="checkbox"[^>]*name="([^"]+)"', page_html)
-            for cb_name in checkbox_matches:
-                login_data[cb_name] = 'on'
+            # AJAX请求头
+            ajax_headers = {
+                'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                'X-Requested-With': 'XMLHttpRequest',
+                'Referer': login_page_resp.url,
+                'Accept': 'application/json, text/javascript, */*; q=0.01',
+            }
             
-            log_debug(f"提交登录到: {login_page_resp.url[:80]}...")
+            log_debug(f"提交登录到: {LOGIN_API}")
             
             login_resp = self.session.post(
-                login_page_resp.url,
+                LOGIN_API,
                 data=login_data,
-                allow_redirects=True,
+                headers=ajax_headers,
+                allow_redirects=False,
                 timeout=30
             )
             
-            log_debug(f"最终URL: {login_resp.url[:100]}...")
-            log_debug(f"状态码: {login_resp.status_code}")
-            log_debug(f"Cookies: {list(self.session.cookies.keys())}")
+            log_debug(f"登录响应状态码: {login_resp.status_code}")
             
-            # 检查是否还在登录页（登录失败）
-            if 'Account/Login' in login_resp.url:
-                log_error("登录失败：仍在登录页面")
-                # 尝试提取错误信息
-                error_match = re.search(r'class="[^"]*error[^"]*"[^>]*>([^<]+)', login_resp.text)
-                if error_match:
-                    log_error(f"错误信息: {error_match.group(1).strip()}")
+            # 解析登录响应（JSON格式）
+            try:
+                resp_json = login_resp.json()
+                status = resp_json.get('status')
+                msg = resp_json.get('msg', '')
+                
+                log_debug(f"登录响应 status: {status}")
+                
+                if status != 1:
+                    log_error(f"登录失败: status={status}, msg={msg}")
+                    return False
+                
+                # 登录成功，msg是授权回调URL（相对路径）
+                log_debug("登录API调用成功，处理重定向URL...")
+                
+                # msg是相对路径，补全域名
+                if msg.startswith('/'):
+                    redirect_url = ACCOUNTS_BASE + msg
+                else:
+                    redirect_url = msg
+                
+                log_debug(f"重定向URL: {redirect_url[:100]}...")
+                
+                # 步骤6：访问重定向URL，完成OAuth2回调
+                log_debug("步骤6：访问重定向URL，完成OAuth2回调...")
+                callback_resp = self.session.get(redirect_url, allow_redirects=True, timeout=30)
+                
+                log_debug(f"回调最终URL: {callback_resp.url[:100]}...")
+                log_debug(f"回调状态码: {callback_resp.status_code}")
+                log_debug(f"回调后Cookies: {list(self.session.cookies.keys())}")
+                
+                # 检查b2_token cookie
+                b2_token_cookie = self.session.cookies.get('b2_token')
+                if b2_token_cookie:
+                    log_debug(f"获取到b2_token cookie")
+                
+            except json.JSONDecodeError:
+                log_error(f"登录响应不是JSON格式: {login_resp.text[:200]}")
+                return False
+            except Exception as e:
+                log_error(f"解析登录响应失败: {e}")
                 return False
             
             # 步骤7：验证登录状态
@@ -477,8 +504,8 @@ class ZwCheckinAPI:
         """
         try:
             headers = {
-                'Content-Type': 'application/json',
-                'Referer': FORUM_BASE + '/'
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': FORUM_BASE + '/mission'
             }
             
             # 如果有b2_token（不是cookie模式），添加Authorization头
@@ -488,7 +515,7 @@ class ZwCheckinAPI:
             response = self.session.post(
                 USER_MISSION_URL,
                 headers=headers,
-                json={},
+                data='count=10&paged=1',
                 timeout=30
             )
             
@@ -499,10 +526,16 @@ class ZwCheckinAPI:
                 mission = data.get('mission', {})
                 
                 # 解析签到状态
-                already_checked = mission.get('user_mission', {}).get('is_complete', False)
-                consecutive_days = mission.get('user_mission', {}).get('continuous_day', 0)
+                # credit字段有值表示今日已签到（与前端JS逻辑一致）
+                credit_val = mission.get('credit', '')
+                already_checked = bool(credit_val)
+                
+                # 连续签到天数
+                tk = mission.get('tk', {})
+                consecutive_days = tk.get('days', 0) if isinstance(tk, dict) else 0
+                
                 total_points = mission.get('my_credit', 0)
-                points_earned = mission.get('user_mission', {}).get('credit', 0)
+                points_earned = credit_val if credit_val else 0
                 
                 return {
                     'already_checked': already_checked,
@@ -545,10 +578,10 @@ class ZwCheckinAPI:
                     'total_points': current_status.get('total_points', 0)
                 }
             
-            # 执行签到
+            # 执行签到（与前端JS一致，使用form-urlencoded格式）
             headers = {
-                'Content-Type': 'application/json',
-                'Referer': FORUM_BASE + '/'
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': FORUM_BASE + '/mission'
             }
             
             # 如果有b2_token（不是cookie模式），添加Authorization头
@@ -558,38 +591,54 @@ class ZwCheckinAPI:
             response = self.session.post(
                 CHECKIN_URL,
                 headers=headers,
-                json={},
+                data='',
                 timeout=30
             )
             
             log_debug(f"签到响应: {response.status_code} - {response.text[:500]}")
             
             if response.status_code == 200:
-                data = response.json()
+                # 签到接口可能返回字符串（积分值）或JSON对象
+                # 先尝试解析JSON
+                points_earned = 0
+                try:
+                    data = response.json()
+                    
+                    # 如果是字典，检查是否有错误
+                    if isinstance(data, dict):
+                        if data.get('code') == 'user_error' or data.get('code') == 403:
+                            error_msg = data.get('message', '签到失败')
+                            log_error(f"签到失败: {error_msg}")
+                            return {
+                                'success': False,
+                                'message': error_msg,
+                                'consecutive_days': 0,
+                                'points_earned': 0,
+                                'total_points': 0
+                            }
+                        
+                        # 如果有mission字段，从中提取积分
+                        if 'mission' in data:
+                            mission = data['mission']
+                            points_earned = mission.get('credit', 0)
+                    elif isinstance(data, str):
+                        # 返回的是字符串形式的积分值
+                        points_earned = data
+                except (json.JSONDecodeError, ValueError):
+                    # 不是JSON，可能是纯文本
+                    points_earned = response.text.strip().strip('"')
                 
-                # 检查是否有错误
-                if data.get('code') == 'user_error' or data.get('code') == 403:
-                    error_msg = data.get('message', '签到失败')
-                    log_error(f"签到失败: {error_msg}")
-                    return {
-                        'success': False,
-                        'message': error_msg,
-                        'consecutive_days': 0,
-                        'points_earned': 0,
-                        'total_points': 0
-                    }
+                # 签到成功（200状态码即表示成功）
+                log_info(f"签到成功！获得积分: {points_earned}")
                 
-                # 签到成功
-                log_info("签到成功！")
-                
-                # 重新获取状态
+                # 重新获取状态验证
                 new_status = self.get_mission_status()
                 if new_status:
                     return {
                         'success': True,
                         'message': '签到成功',
                         'consecutive_days': new_status.get('consecutive_days', 0),
-                        'points_earned': new_status.get('points_earned', 0),
+                        'points_earned': new_status.get('points_earned', points_earned),
                         'total_points': new_status.get('total_points', 0)
                     }
                 
@@ -597,7 +646,7 @@ class ZwCheckinAPI:
                     'success': True,
                     'message': '签到成功',
                     'consecutive_days': 0,
-                    'points_earned': 0,
+                    'points_earned': points_earned,
                     'total_points': 0
                 }
             else:
@@ -693,38 +742,10 @@ def checkin_selenium(username, password):
         # 设置超时
         wait = WebDriverWait(driver, 30)
         
-        # 访问论坛首页
-        log_info("访问论坛首页...")
-        driver.get(FORUM_BASE)
+        # 访问论坛登录页
+        log_info("访问论坛登录页...")
+        driver.get(LOGIN_PHP)
         time.sleep(3)
-        
-        # 点击登录按钮
-        log_info("点击登录按钮...")
-        try:
-            login_btn = wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//a[contains(text(), "登录") or contains(@class, "login")]'))
-            )
-            login_btn.click()
-        except:
-            # 尝试其他选择器
-            try:
-                login_btn = driver.find_element(By.CSS_SELECTOR, '.signin-btn, .login-btn, [class*="login"]')
-                login_btn.click()
-            except:
-                log_error("未找到登录按钮")
-                return {
-                    'success': False,
-                    'message': '未找到登录按钮',
-                    'consecutive_days': 0,
-                    'points_earned': 0,
-                    'total_points': 0
-                }
-        
-        time.sleep(3)
-        
-        # 切换到新窗口（如果有）
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[-1])
         
         # 输入用户名密码
         log_info("输入账号密码...")
@@ -763,15 +784,11 @@ def checkin_selenium(username, password):
         
         # 等待登录完成，跳转到论坛
         log_info("等待登录完成...")
-        for i in range(10):
-            if FORUM_BASE in driver.current_url:
+        for i in range(15):
+            if FORUM_BASE in driver.current_url and 'login' not in driver.current_url.lower():
                 log_info("已跳转到论坛")
                 break
             time.sleep(2)
-        
-        # 切换回主窗口
-        if len(driver.window_handles) > 1:
-            driver.switch_to.window(driver.window_handles[0])
         
         time.sleep(3)
         
@@ -905,7 +922,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v4.0.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v6.0.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
