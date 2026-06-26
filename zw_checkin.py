@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 3.2.0
+@Version      : 3.3.0
 
 环境变量:
   ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -25,6 +25,11 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v3.3.0:
+  - 修复授权码 invalid_grant 错误
+  - 发现授权码后立即停止重定向，避免code被消耗
+  - 优化重定向跟踪逻辑，提高token获取成功率
 
 更新日志 v3.2.0:
   - 修复b2_token获取问题，增加多步重定向跟踪
@@ -498,7 +503,7 @@ class ZwCheckinAPI:
                 log_debug(f"最终跳转URL: {redirect_url[:100]}...")
                 
                 # 访问跳转URL，跟踪重定向过程
-                # 先手动跟踪重定向，检查每一步的cookie
+                # 关键：发现授权码后立即停止，不要让论坛回调页面消耗掉code
                 current_url = redirect_url
                 max_redirects = 10
                 code_found = None
@@ -521,7 +526,7 @@ class ZwCheckinAPI:
                         log_info("登录成功（获取到 b2_token cookie）")
                         return True
                     
-                    # 检查当前URL中是否有code
+                    # 检查当前URL中是否有code（授权码）
                     if 'code=' in step_response.url:
                         parsed = urllib.parse.urlparse(step_response.url)
                         query_params = urllib.parse.parse_qs(parsed.query)
@@ -529,6 +534,11 @@ class ZwCheckinAPI:
                         if code:
                             code_found = code
                             log_debug(f"在URL中找到授权码: {code[:20]}...")
+                            
+                            # 关键：发现授权码后立即停止重定向
+                            # 继续访问论坛回调页面会消耗掉code，导致invalid_grant错误
+                            log_debug("发现授权码，停止重定向，直接使用授权码换取token...")
+                            break
                     
                     # 检查响应body中是否有b2_token（可能通过JS设置）
                     page_text = step_response.text
@@ -545,6 +555,31 @@ class ZwCheckinAPI:
                         next_url = step_response.headers.get('Location', '')
                         if not next_url:
                             break
+                        
+                        # 检查重定向目标中是否有code
+                        # 如果有，直接用这个code换token，不继续重定向
+                        if 'code=' in next_url and not code_found:
+                            if next_url.startswith('http'):
+                                parsed_next = urllib.parse.urlparse(next_url)
+                            else:
+                                # 相对路径，先补全
+                                if next_url.startswith('/'):
+                                    next_full = f'https://forum.zwsoft.cn{next_url}' if 'forum.zwsoft.cn' in current_url else f'https://accounts.zwsoft.cn{next_url}'
+                                else:
+                                    from urllib.parse import urljoin
+                                    next_full = urljoin(current_url, next_url)
+                                parsed_next = urllib.parse.urlparse(next_full)
+                            
+                            next_query = urllib.parse.parse_qs(parsed_next.query)
+                            next_code = next_query.get('code', [''])[0]
+                            if next_code:
+                                code_found = next_code
+                                log_debug(f"从重定向目标中找到授权码: {next_code[:20]}...")
+                                
+                                # 发现授权码就立即停止重定向
+                                log_debug("发现授权码，停止重定向，直接使用授权码换取token...")
+                                break
+                        
                         if next_url.startswith('/'):
                             next_url = f'https://forum.zwsoft.cn{next_url}' if 'forum.zwsoft.cn' in current_url else f'https://accounts.zwsoft.cn{next_url}'
                         elif next_url.startswith('http'):
@@ -559,15 +594,6 @@ class ZwCheckinAPI:
                     else:
                         # 没有重定向了，检查最终页面
                         log_debug(f"到达最终页面: {step_response.url[:80]}...")
-                        
-                        # 再检查一次code
-                        if 'code=' in step_response.url and not code_found:
-                            parsed = urllib.parse.urlparse(step_response.url)
-                            query_params = urllib.parse.parse_qs(parsed.query)
-                            code = query_params.get('code', [''])[0]
-                            if code:
-                                code_found = code
-                        
                         break
                 
                 # 如果找到了授权码，用它换取token
@@ -1274,7 +1300,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v3.2.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v3.3.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
