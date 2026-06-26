@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 3.3.0
+@Version      : 3.4.0
 
 环境变量:
   ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -25,6 +25,12 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v3.4.0:
+  - 重构登录流程，采用多方案降级策略
+  - 方案A：完成所有重定向后用cookie模式（优先）
+  - 方案C：重新发起授权请求获取新的授权码
+  - 提高登录成功率和稳定性
 
 更新日志 v3.3.0:
   - 修复授权码 invalid_grant 错误
@@ -502,120 +508,31 @@ class ZwCheckinAPI:
                 
                 log_debug(f"最终跳转URL: {redirect_url[:100]}...")
                 
-                # 访问跳转URL，跟踪重定向过程
-                # 关键：发现授权码后立即停止，不要让论坛回调页面消耗掉code
-                current_url = redirect_url
-                max_redirects = 10
-                code_found = None
+                # 方案A：先尝试完成所有重定向，让论坛处理登录，然后用cookie模式
+                log_debug("方案A：完成所有重定向，尝试cookie模式登录...")
                 
-                for i in range(max_redirects):
-                    log_debug(f"重定向步骤 {i+1}: 访问 {current_url[:80]}...")
-                    
-                    step_response = self.session.get(
-                        current_url,
-                        allow_redirects=False,
-                        timeout=30
-                    )
-                    
-                    log_debug(f"  状态码: {step_response.status_code}")
-                    log_debug(f"  当前Cookies: {list(self.session.cookies.keys())}")
-                    
-                    # 检查是否有b2_token
-                    if self.session.cookies.get('b2_token'):
-                        self.b2_token = self.session.cookies.get('b2_token')
-                        log_info("登录成功（获取到 b2_token cookie）")
-                        return True
-                    
-                    # 检查当前URL中是否有code（授权码）
-                    if 'code=' in step_response.url:
-                        parsed = urllib.parse.urlparse(step_response.url)
-                        query_params = urllib.parse.parse_qs(parsed.query)
-                        code = query_params.get('code', [''])[0]
-                        if code:
-                            code_found = code
-                            log_debug(f"在URL中找到授权码: {code[:20]}...")
-                            
-                            # 关键：发现授权码后立即停止重定向
-                            # 继续访问论坛回调页面会消耗掉code，导致invalid_grant错误
-                            log_debug("发现授权码，停止重定向，直接使用授权码换取token...")
-                            break
-                    
-                    # 检查响应body中是否有b2_token（可能通过JS设置）
-                    page_text = step_response.text
-                    if 'b2_token' in page_text:
-                        # 尝试从页面中提取token
-                        b2_match = re.search(r'b2_token["\s:=]+["\']([^"\']+)["\']', page_text)
-                        if b2_match:
-                            self.b2_token = b2_match.group(1)
-                            log_info("登录成功（从页面中提取到 b2_token）")
-                            return True
-                    
-                    # 检查是否有重定向
-                    if step_response.status_code in [301, 302, 303, 307, 308]:
-                        next_url = step_response.headers.get('Location', '')
-                        if not next_url:
-                            break
-                        
-                        # 检查重定向目标中是否有code
-                        # 如果有，直接用这个code换token，不继续重定向
-                        if 'code=' in next_url and not code_found:
-                            if next_url.startswith('http'):
-                                parsed_next = urllib.parse.urlparse(next_url)
-                            else:
-                                # 相对路径，先补全
-                                if next_url.startswith('/'):
-                                    next_full = f'https://forum.zwsoft.cn{next_url}' if 'forum.zwsoft.cn' in current_url else f'https://accounts.zwsoft.cn{next_url}'
-                                else:
-                                    from urllib.parse import urljoin
-                                    next_full = urljoin(current_url, next_url)
-                                parsed_next = urllib.parse.urlparse(next_full)
-                            
-                            next_query = urllib.parse.parse_qs(parsed_next.query)
-                            next_code = next_query.get('code', [''])[0]
-                            if next_code:
-                                code_found = next_code
-                                log_debug(f"从重定向目标中找到授权码: {next_code[:20]}...")
-                                
-                                # 发现授权码就立即停止重定向
-                                log_debug("发现授权码，停止重定向，直接使用授权码换取token...")
-                                break
-                        
-                        if next_url.startswith('/'):
-                            next_url = f'https://forum.zwsoft.cn{next_url}' if 'forum.zwsoft.cn' in current_url else f'https://accounts.zwsoft.cn{next_url}'
-                        elif next_url.startswith('http'):
-                            pass
-                        else:
-                            # 相对路径
-                            from urllib.parse import urljoin
-                            next_url = urljoin(current_url, next_url)
-                        
-                        log_debug(f"  重定向到: {next_url[:80]}...")
-                        current_url = next_url
-                    else:
-                        # 没有重定向了，检查最终页面
-                        log_debug(f"到达最终页面: {step_response.url[:80]}...")
-                        break
+                full_response = self.session.get(
+                    redirect_url,
+                    allow_redirects=True,
+                    timeout=30
+                )
                 
-                # 如果找到了授权码，用它换取token
-                if code_found:
-                    log_debug(f"使用授权码换取token...")
-                    return self._exchange_token(code_found)
+                log_debug(f"最终URL: {full_response.url[:100]}...")
+                log_debug(f"当前Cookies: {list(self.session.cookies.keys())}")
                 
-                # 如果还没有b2_token，尝试用access_token直接调用API
-                log_debug("未获取到b2_token，尝试其他方式...")
+                # 检查是否有b2_token cookie
+                if self.session.cookies.get('b2_token'):
+                    self.b2_token = self.session.cookies.get('b2_token')
+                    log_info("登录成功（获取到 b2_token cookie）")
+                    return True
                 
-                # 方案B: 检查是否有access_token相关的cookie
-                all_cookies = dict(self.session.cookies)
-                log_debug(f"所有Cookie: {list(all_cookies.keys())}")
-                
-                # 方案C: 尝试直接访问论坛的用户页面，看看是否已登录
-                log_debug("尝试访问论坛用户接口测试登录状态...")
+                # 检查是否已通过cookie登录（调用用户接口测试）
+                log_debug("测试是否已通过cookie登录...")
                 test_headers = {
                     'Content-Type': 'application/json',
                     'Referer': FORUM_BASE + '/'
                 }
                 
-                # 尝试不带token调用一次，看看返回什么
                 test_response = self.session.post(
                     USER_MISSION_URL,
                     headers=test_headers,
@@ -630,14 +547,116 @@ class ZwCheckinAPI:
                     mission = test_data.get('mission', {})
                     if mission.get('current_user', 0) > 0:
                         log_info("登录成功（已通过cookie登录论坛）")
-                        # 尝试从cookie中找可用的token
-                        # 或者可能不需要token，cookie已经够用了
-                        # 先设置一个标记，签到时用cookie方式
                         self.b2_token = '__cookie_mode__'
                         return True
                 
-                log_error(f"登录失败：未能获取到有效的登录凭证")
-                log_debug(f"最终URL: {current_url[:100]}")
+                log_debug("方案A失败，尝试方案B...")
+                
+                # 方案B：手动跟踪重定向，在论坛callback页面前提取code
+                log_debug("方案B：手动跟踪重定向，尝试提取授权码...")
+                
+                # 重新开始（需要重新获取登录URL，因为session可能已经变了）
+                # 先重新获取一次跳转URL（不，直接用redirect_url重新开始，但用新session？不对，session已经被修改了）
+                # 实际上，我们可以从当前的full_response回溯，或者直接尝试从之前的步骤中提取
+                
+                # 方案C：直接访问授权URL，重新走一遍授权流程
+                # 因为session已经有了登录态（IdentityServer那边已经登录了），
+                # 这次访问应该会直接跳转到callback，带code
+                
+                log_debug("方案C：重新发起授权请求获取code...")
+                
+                # 重新生成PKCE参数
+                new_code_verifier = generate_code_verifier()
+                new_code_challenge = generate_code_challenge(new_code_verifier)
+                new_state = generate_state()
+                
+                new_auth_params = {
+                    'response_type': 'code',
+                    'client_id': CLIENT_ID,
+                    'scope': SCOPE,
+                    'redirect_uri': LOGIN_CALLBACK,
+                    'state': new_state,
+                    'code_challenge': new_code_challenge,
+                    'code_challenge_method': 'S256',
+                    'token': f'login_time_{int(time.time())}'
+                }
+                
+                new_auth_url = f'{AUTHORIZE_URL}?{urllib.parse.urlencode(new_auth_params)}'
+                log_debug(f"新授权URL: {new_auth_url[:80]}...")
+                
+                # 手动跟踪重定向，在论坛callback页面前停止
+                current_url = new_auth_url
+                new_code_found = None
+                
+                for i in range(10):
+                    log_debug(f"授权步骤 {i+1}: 访问 {current_url[:80]}...")
+                    
+                    step_resp = self.session.get(
+                        current_url,
+                        allow_redirects=False,
+                        timeout=30
+                    )
+                    
+                    log_debug(f"  状态码: {step_resp.status_code}")
+                    
+                    # 检查当前URL中是否有code
+                    if 'code=' in step_resp.url and not new_code_found:
+                        parsed = urllib.parse.urlparse(step_resp.url)
+                        query_params = urllib.parse.parse_qs(parsed.query)
+                        code = query_params.get('code', [''])[0]
+                        if code:
+                            new_code_found = code
+                            log_debug(f"在URL中找到授权码: {code[:20]}...")
+                            
+                            # 如果是论坛callback页面，立即停止
+                            if 'login.php' in step_resp.url:
+                                log_debug("到达论坛回调页面，停止重定向")
+                                break
+                    
+                    # 检查重定向目标中是否有code
+                    if step_resp.status_code in [301, 302, 303, 307, 308]:
+                        next_url = step_resp.headers.get('Location', '')
+                        if not next_url:
+                            break
+                        
+                        if 'code=' in next_url and not new_code_found:
+                            if 'login.php' in next_url:
+                                # 重定向到论坛callback且有code，提取code并停止
+                                if next_url.startswith('http'):
+                                    parsed_next = urllib.parse.urlparse(next_url)
+                                else:
+                                    parsed_next = urllib.parse.urlparse(f'https://forum.zwsoft.cn{next_url}')
+                                next_query = urllib.parse.parse_qs(parsed_next.query)
+                                next_code = next_query.get('code', [''])[0]
+                                if next_code:
+                                    new_code_found = next_code
+                                    log_debug(f"从重定向目标中找到授权码: {next_code[:20]}...")
+                                    break
+                        
+                        # 补全URL
+                        if next_url.startswith('/'):
+                            next_url = f'https://forum.zwsoft.cn{next_url}' if 'forum.zwsoft.cn' in current_url else f'https://accounts.zwsoft.cn{next_url}'
+                        elif not next_url.startswith('http'):
+                            from urllib.parse import urljoin
+                            next_url = urljoin(current_url, next_url)
+                        
+                        log_debug(f"  重定向到: {next_url[:80]}...")
+                        current_url = next_url
+                    else:
+                        # 没有重定向了
+                        log_debug(f"到达最终页面: {step_resp.url[:80]}...")
+                        break
+                
+                # 如果找到了新的授权码，用它换token
+                if new_code_found:
+                    log_debug("使用新授权码换取token...")
+                    # 更新code_verifier
+                    self.code_verifier = new_code_verifier
+                    self.state = new_state
+                    return self._exchange_token(new_code_found)
+                
+                # 所有方案都失败了
+                log_error("登录失败：所有方案均未能获取有效的登录凭证")
                 return False
             
             # status=0: 登录失败
@@ -1300,7 +1319,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v3.3.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v3.4.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
