@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 6.5.0
+@Version      : 7.0.0
 
 环境变量:
   ZWSOFT_USERNAME     - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -14,7 +14,8 @@
   ZWSOFT_MODE         - 运行模式，api=纯API模式 selenium=浏览器模式 auto=自动尝试（默认auto）
   ZWSOFT_QL_NOTIFY    - 是否启用青龙面板通知，true/false（默认：配置WXPusher后自动禁用）
   WXPUSHER_APP_TOKEN  - WXPusher应用Token（可选，用于微信推送）
-  WXPUSHER_UIDS       - WXPusher接收者UID，多个用逗号分隔（可选）
+  WXPUSHER_UIDS       - WXPusher全局接收者UID，多个用逗号分隔（可选，所有账号都推送到这些UID）
+  WXPUSHER_USER_MAP   - 账号与UID映射，格式：账号1=UID1,账号2=UID2（可选，不同账号推送到不同微信）
 
 依赖库:
   requests>=2.28.0
@@ -28,6 +29,13 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v7.0.0:
+  - 重大更新：支持多账号分别推送到不同微信（WXPUSHER_USER_MAP）
+  - 智能合并：相同微信（UID）的多个账号会自动合并成一条消息，不会重复推送
+  - 灵活配置：支持账号与UID一对一、一对多映射
+  - 向后兼容：不配置 USER_MAP 时，保持原有全局UID推送行为
+  - 新增 WXPUSHER_USER_MAP 环境变量
 
 更新日志 v6.5.0:
   - 优化 WXPusher 消息列表显示：添加 summary 字段，列表只显示简短标题
@@ -110,6 +118,7 @@ ENV_QL_NOTIFY = 'ZWSOFT_QL_NOTIFY'
 # WXPusher 推送配置
 ENV_WXPUSHER_APP_TOKEN = 'WXPUSHER_APP_TOKEN'
 ENV_WXPUSHER_UIDS = 'WXPUSHER_UIDS'
+ENV_WXPUSHER_USER_MAP = 'WXPUSHER_USER_MAP'  # 账号与UID映射，格式：账号1=UID1,账号2=UID2
 
 # 中望社区URL配置
 PUBKEY_URL = 'https://accounts.zwsoft.cn/Common/Getpubkeys'
@@ -136,7 +145,101 @@ RUN_MODE = os.getenv(ENV_MODE, 'auto').lower()
 # WXPusher 配置
 WXPUSHER_APP_TOKEN = os.getenv(ENV_WXPUSHER_APP_TOKEN, '').strip()
 WXPUSHER_UIDS = os.getenv(ENV_WXPUSHER_UIDS, '').strip()
-HAS_WXPUSHER = bool(WXPUSHER_APP_TOKEN and WXPUSHER_UIDS)
+WXPUSHER_USER_MAP = os.getenv(ENV_WXPUSHER_USER_MAP, '').strip()
+HAS_WXPUSHER = bool(WXPUSHER_APP_TOKEN and (WXPUSHER_UIDS or WXPUSHER_USER_MAP))
+
+# 解析WXPusher UID列表
+def _parse_wxpusher_uids(uids_str):
+    """解析UID字符串，返回UID列表"""
+    import re
+    if not uids_str:
+        return []
+    return [uid.strip() for uid in re.split(r'[,，\n\s]+', uids_str) if uid.strip()]
+
+# 解析账号-UID映射
+def _parse_wxpusher_user_map(map_str):
+    """
+    解析账号与UID的映射关系
+    
+    支持格式：
+    - 账号1=UID1,账号2=UID2
+    - 账号1:UID1;账号2:UID2
+    - 每行一个：账号1=UID1\n账号2=UID2
+    
+    Returns:
+        dict: {username: [uid1, uid2, ...]}
+    """
+    user_map = {}
+    if not map_str:
+        return user_map
+    
+    import re
+    # 按逗号、分号、换行分割
+    entries = re.split(r'[,，;\n]+', map_str)
+    for entry in entries:
+        entry = entry.strip()
+        if not entry:
+            continue
+        # 支持 = 或 : 分隔
+        if '=' in entry:
+            parts = entry.split('=', 1)
+        elif ':' in entry:
+            parts = entry.split(':', 1)
+        else:
+            continue
+        
+        username = parts[0].strip()
+        uids_str = parts[1].strip()
+        if username and uids_str:
+            uids = _parse_wxpusher_uids(uids_str)
+            if uids:
+                user_map[username] = uids
+    
+    return user_map
+
+# 获取账号对应的UID列表
+def get_uids_for_user(username):
+    """
+    获取指定账号对应的WXPusher UID列表
+    
+    优先级：
+    1. 如果配置了 WXPUSHER_USER_MAP，且账号在映射中，返回映射的UID
+    2. 否则返回全局 WXPUSHER_UIDS
+    3. 如果都没有配置，返回空列表
+    
+    Args:
+        username: 账号用户名
+    
+    Returns:
+        list: UID列表
+    """
+    # 先检查用户映射
+    user_map = _parse_wxpusher_user_map(WXPUSHER_USER_MAP)
+    if username in user_map:
+        return user_map[username]
+    
+    # 返回全局UID
+    return _parse_wxpusher_uids(WXPUSHER_UIDS)
+
+# 获取所有需要推送的UID（去重）
+def get_all_uids():
+    """
+    获取所有配置的UID（去重）
+    
+    Returns:
+        list: 所有UID的列表
+    """
+    all_uids = set()
+    
+    # 全局UID
+    all_uids.update(_parse_wxpusher_uids(WXPUSHER_UIDS))
+    
+    # 用户映射中的UID
+    user_map = _parse_wxpusher_user_map(WXPUSHER_USER_MAP)
+    for uids in user_map.values():
+        all_uids.update(uids)
+    
+    return list(all_uids)
 
 # 青龙通知配置：如果已配置 WXPusher，默认禁用青龙通知避免重复推送
 # 可以通过 ZWSOFT_QL_NOTIFY=true 强制启用青龙通知
@@ -150,13 +253,14 @@ else:
     HAS_NOTIFY = _has_ql_notify_module and not HAS_WXPUSHER
 
 
-def wxpusher_push(title, content):
+def wxpusher_push(title, content, uids=None):
     """
     使用WXPusher推送消息
     
     Args:
         title: 消息标题
         content: 消息内容（支持HTML）
+        uids: 指定推送的UID列表，None则使用全部配置的UID
     
     Returns:
         bool: 是否推送成功
@@ -166,9 +270,9 @@ def wxpusher_push(title, content):
         return False
     
     try:
-        # 解析UID列表（支持逗号、换行、空格分隔）
-        import re
-        uids = [uid.strip() for uid in re.split(r'[,，\n\s]+', WXPUSHER_UIDS) if uid.strip()]
+        # 如果没有指定UID，使用全部配置的UID
+        if uids is None:
+            uids = get_all_uids()
         
         if not uids:
             log_error("WXPusher UID列表为空")
@@ -1077,12 +1181,91 @@ def do_checkin(account, index):
 
 # ==================== 主函数 ====================
 
+def _build_account_content(item):
+    """构建单个账号的签到结果内容"""
+    r = item['result']
+    masked_name = mask_username(item['username'])
+    if r.get('success'):
+        content = f"✅ 签到成功！\n"
+        content += f"   账号：{masked_name}\n"
+        content += f"   连续签到: {r.get('consecutive_days', 0)} 天\n"
+        content += f"   获得积分: {r.get('points_earned', 0)}\n"
+        content += f"   总积分: {r.get('total_points', 0)}\n"
+    else:
+        content = f"❌ 签到失败\n"
+        content += f"   账号：{masked_name}\n"
+        content += f"   原因: {r.get('message', '未知错误')}\n"
+    return content
+
+
+def _send_wxpusher_by_group(results, start_time, success_count, fail_count, duration):
+    """
+    按UID分组发送WXPusher通知
+    
+    逻辑：
+    1. 遍历每个账号，获取其对应的UID列表
+    2. 按UID分组，相同UID的账号合并到同一条消息
+    3. 分别发送给每个UID（一条消息包含该UID对应的所有账号结果）
+    
+    Args:
+        results: 签到结果列表
+        start_time: 开始时间
+        success_count: 成功数量
+        fail_count: 失败数量
+        duration: 耗时（秒）
+    """
+    if not HAS_WXPUSHER:
+        return
+    
+    # 按UID分组
+    uid_groups = {}  # {uid: [item1, item2, ...]}
+    
+    for item in results:
+        username = item['username']
+        uids = get_uids_for_user(username)
+        for uid in uids:
+            if uid not in uid_groups:
+                uid_groups[uid] = []
+            uid_groups[uid].append(item)
+    
+    log_debug(f"WXPusher分组推送：共 {len(uid_groups)} 个UID分组")
+    
+    # 为每个UID分组发送一条消息
+    for uid, group_items in uid_groups.items():
+        # 统计该分组的成功/失败数
+        group_success = sum(1 for item in group_items if item['result'].get('success'))
+        group_fail = len(group_items) - group_success
+        
+        # 确定标题
+        if group_fail > 0:
+            title = f"⚠️ 中望签到 - {group_fail}个账号失败"
+        else:
+            title = f"✅ 中望签到 - 全部成功"
+        
+        # 构建内容
+        content = ""
+        for item in group_items:
+            content += _build_account_content(item) + "\n"
+        
+        content += f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        content += f"成功: {group_success} 个"
+        if group_fail > 0:
+            content += f" | 失败: {group_fail} 个"
+        content += f" | 耗时: {duration:.1f} 秒"
+        
+        # 发送
+        try:
+            wxpusher_push(title, content, uids=[uid])
+        except Exception as e:
+            log_error(f"WXPusher推送到UID {uid} 失败: {e}")
+
+
 def main():
     """主函数"""
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v6.5.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v7.0.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
@@ -1122,46 +1305,46 @@ def main():
     print(f"{'#'*50}\n")
     
     # 发送通知
-    if fail_count > 0:
-        # 有失败，发送异常通知
-        title = f"⚠️ 中望签到 - {fail_count}个账号失败"
-        content = f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"成功: {success_count} 个 | 失败: {fail_count} 个\n"
-        content += f"耗时: {duration:.1f} 秒\n\n"
+    if fail_count > 0 or NOTIFY_LEVEL >= 2:
+        # 构建完整内容（用于青龙通知/调试输出）
+        if fail_count > 0:
+            title = f"⚠️ 中望签到 - {fail_count}个账号失败"
+            level = 1
+        else:
+            title = f"✅ 中望签到 - 全部成功"
+            level = 2
         
+        # 构建完整内容
+        full_content = ""
         for item in results:
-            r = item['result']
-            masked_name = mask_username(item['username'])
-            if r.get('success'):
-                content += f"✅ 签到成功！\n"
-                content += f"   账号：{masked_name}\n"
-                content += f"   连续签到: {r.get('consecutive_days', 0)} 天\n"
-                content += f"   获得积分: {r.get('points_earned', 0)}\n"
-                content += f"   总积分: {r.get('total_points', 0)}\n\n"
-            else:
-                content += f"❌ 签到失败\n"
-                content += f"   账号：{masked_name}\n"
-                content += f"   原因: {r.get('message', '未知错误')}\n\n"
+            full_content += _build_account_content(item) + "\n"
         
-        notify(title, content, level=1)
-    elif NOTIFY_LEVEL >= 2:
-        # 全部成功，且通知级别>=2，发送成功通知
-        title = f"✅ 中望签到 - 全部成功"
+        full_content += f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        full_content += f"成功: {success_count} 个"
+        if fail_count > 0:
+            full_content += f" | 失败: {fail_count} 个"
+        full_content += f" | 耗时: {duration:.1f} 秒"
         
-        content = ""
-        for item in results:
-            r = item['result']
-            masked_name = mask_username(item['username'])
-            content += f"✅ 签到成功！\n"
-            content += f"   账号：{masked_name}\n"
-            content += f"   连续签到: {r.get('consecutive_days', 0)} 天\n"
-            content += f"   获得积分: {r.get('points_earned', 0)}\n"
-            content += f"   总积分: {r.get('total_points', 0)}\n\n"
+        # 青龙面板通知（完整内容）
+        if HAS_NOTIFY and NOTIFY_LEVEL >= level:
+            try:
+                ql_send(title, full_content)
+            except Exception as e:
+                log_error(f"青龙通知失败: {e}")
         
-        content += f"执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        content += f"成功: {success_count} 个 | 耗时: {duration:.1f} 秒"
+        # WXPusher 分组推送（按UID分组，相同微信合并成一条）
+        if HAS_WXPUSHER and NOTIFY_LEVEL >= level:
+            try:
+                _send_wxpusher_by_group(results, start_time, success_count, fail_count, duration)
+            except Exception as e:
+                log_error(f"WXPusher分组推送失败: {e}")
         
-        notify(title, content, level=2)
+        # 控制台输出
+        print(f"\n{'='*50}")
+        print(f"📢 {title}")
+        print(f"{'-'*50}")
+        print(f"{full_content}")
+        print(f"{'='*50}\n")
 
 
 if __name__ == '__main__':
