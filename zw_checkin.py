@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 6.3.0
+@Version      : 6.4.0
 
 环境变量:
   ZWSOFT_USERNAME     - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -12,6 +12,7 @@
   ZWSOFT_NOTIFY       - 通知级别，0=关闭 1=仅异常 2=全部通知（默认1）
   ZWSOFT_DEBUG        - 调试模式，true/false（默认false）
   ZWSOFT_MODE         - 运行模式，api=纯API模式 selenium=浏览器模式 auto=自动尝试（默认auto）
+  ZWSOFT_QL_NOTIFY    - 是否启用青龙面板通知，true/false（默认：配置WXPusher后自动禁用）
   WXPUSHER_APP_TOKEN  - WXPusher应用Token（可选，用于微信推送）
   WXPUSHER_UIDS       - WXPusher接收者UID，多个用逗号分隔（可选）
 
@@ -27,6 +28,11 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v6.4.0:
+  - 修复重复推送问题：配置 WXPusher 后自动禁用青龙面板通知，避免同时收到两条相同消息
+  - 新增 ZWSOFT_QL_NOTIFY 环境变量，可手动控制是否启用青龙通知（true/false）
+  - 默认策略：配置了 WXPusher 则只用 WXPusher 推送，未配置则用青龙通知
 
 更新日志 v6.3.0:
   - 修复连续签到天数显示错误：改为使用 mission.always 字段（前端显示"连续签到：XX天"）
@@ -94,6 +100,7 @@ ENV_PASSWORD = 'ZWSOFT_PASSWORD'
 ENV_NOTIFY = 'ZWSOFT_NOTIFY'
 ENV_DEBUG = 'ZWSOFT_DEBUG'
 ENV_MODE = 'ZWSOFT_MODE'
+ENV_QL_NOTIFY = 'ZWSOFT_QL_NOTIFY'
 
 # WXPusher 推送配置
 ENV_WXPUSHER_APP_TOKEN = 'WXPUSHER_APP_TOKEN'
@@ -113,9 +120,9 @@ ACCOUNTS_BASE = 'https://accounts.zwsoft.cn'
 
 try:
     from notify import send as ql_send
-    HAS_NOTIFY = True
+    _has_ql_notify_module = True
 except ImportError:
-    HAS_NOTIFY = False
+    _has_ql_notify_module = False
 
 NOTIFY_LEVEL = int(os.getenv(ENV_NOTIFY, '1'))
 DEBUG = os.getenv(ENV_DEBUG, 'false').lower() == 'true'
@@ -125,6 +132,17 @@ RUN_MODE = os.getenv(ENV_MODE, 'auto').lower()
 WXPUSHER_APP_TOKEN = os.getenv(ENV_WXPUSHER_APP_TOKEN, '').strip()
 WXPUSHER_UIDS = os.getenv(ENV_WXPUSHER_UIDS, '').strip()
 HAS_WXPUSHER = bool(WXPUSHER_APP_TOKEN and WXPUSHER_UIDS)
+
+# 青龙通知配置：如果已配置 WXPusher，默认禁用青龙通知避免重复推送
+# 可以通过 ZWSOFT_QL_NOTIFY=true 强制启用青龙通知
+_ql_notify_env = os.getenv(ENV_QL_NOTIFY, '').lower().strip()
+if _ql_notify_env == 'true':
+    HAS_NOTIFY = _has_ql_notify_module
+elif _ql_notify_env == 'false':
+    HAS_NOTIFY = False
+else:
+    # 未显式设置时：如果配置了 WXPusher 则禁用青龙通知，否则启用
+    HAS_NOTIFY = _has_ql_notify_module and not HAS_WXPUSHER
 
 
 def wxpusher_push(title, content):
@@ -1057,7 +1075,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v6.3.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v6.4.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
