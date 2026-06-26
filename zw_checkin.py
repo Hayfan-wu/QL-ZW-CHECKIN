@@ -4,14 +4,15 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 7.0.0
+@Version      : 8.0.0
 
 环境变量:
   ZWSOFT_USERNAME     - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
   ZWSOFT_PASSWORD     - 中望社区密码，多账号用换行或&分隔（与账号一一对应）
   ZWSOFT_NOTIFY       - 通知级别，0=关闭 1=仅异常 2=全部通知（默认1）
   ZWSOFT_DEBUG        - 调试模式，true/false（默认false）
-  ZWSOFT_MODE         - 运行模式，api=纯API模式 selenium=浏览器模式 auto=自动尝试（默认auto）
+  ZWSOFT_RETRY_COUNT  - 失败重试次数（默认1次，即总共尝试2次）
+  ZWSOFT_RETRY_INTERVAL - 重试间隔秒数（默认180秒=3分钟）
   ZWSOFT_QL_NOTIFY    - 是否启用青龙面板通知，true/false（默认：配置WXPusher后自动禁用）
   WXPUSHER_APP_TOKEN  - WXPusher应用Token（可选，用于微信推送）
   WXPUSHER_UIDS       - WXPusher全局接收者UID，多个用逗号分隔（可选，所有账号都推送到这些UID）
@@ -19,7 +20,7 @@
 
 依赖库:
   requests>=2.28.0
-  pycryptodome>=3.15.0  (API模式需要，用于RSA密码加密)
+  pycryptodome>=3.15.0  (用于RSA密码加密)
 
 cron: 0 0 1 * * *
 定时规则：每天凌晨1点执行
@@ -27,8 +28,15 @@ cron: 0 0 1 * * *
 使用说明：
   1. 在青龙面板环境变量中添加 ZWSOFT_USERNAME 和 ZWSOFT_PASSWORD
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
-  3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
-  4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+  3. 签到失败会自动重试，默认间隔3分钟重试1次
+  4. 支持 WXPusher 微信推送，配置后自动禁用青龙通知避免重复
+
+更新日志 v8.0.0:
+  - 移除 Selenium 模式，统一使用 API 模式（更轻量更稳定）
+  - 新增失败重试机制：签到失败后自动重试，默认间隔3分钟重试1次
+  - 新增 ZWSOFT_RETRY_COUNT 环境变量：控制重试次数
+  - 新增 ZWSOFT_RETRY_INTERVAL 环境变量：控制重试间隔（秒）
+  - 简化代码结构，提升可维护性
 
 更新日志 v7.0.0:
   - 重大更新：支持多账号分别推送到不同微信（WXPUSHER_USER_MAP）
@@ -112,7 +120,8 @@ ENV_USERNAME = 'ZWSOFT_USERNAME'
 ENV_PASSWORD = 'ZWSOFT_PASSWORD'
 ENV_NOTIFY = 'ZWSOFT_NOTIFY'
 ENV_DEBUG = 'ZWSOFT_DEBUG'
-ENV_MODE = 'ZWSOFT_MODE'
+ENV_RETRY_COUNT = 'ZWSOFT_RETRY_COUNT'
+ENV_RETRY_INTERVAL = 'ZWSOFT_RETRY_INTERVAL'
 ENV_QL_NOTIFY = 'ZWSOFT_QL_NOTIFY'
 
 # WXPusher 推送配置
@@ -140,7 +149,10 @@ except ImportError:
 
 NOTIFY_LEVEL = int(os.getenv(ENV_NOTIFY, '1'))
 DEBUG = os.getenv(ENV_DEBUG, 'false').lower() == 'true'
-RUN_MODE = os.getenv(ENV_MODE, 'auto').lower()
+
+# 重试配置
+RETRY_COUNT = int(os.getenv(ENV_RETRY_COUNT, '1'))  # 失败重试次数（默认1次，即总共尝试2次）
+RETRY_INTERVAL = int(os.getenv(ENV_RETRY_INTERVAL, '180'))  # 重试间隔（秒），默认180秒=3分钟
 
 # WXPusher 配置
 WXPUSHER_APP_TOKEN = os.getenv(ENV_WXPUSHER_APP_TOKEN, '').strip()
@@ -937,186 +949,11 @@ class ZwCheckinAPI:
             }
 
 
-# ==================== Selenium 模式（备用） ====================
-
-def checkin_selenium(username, password):
-    """
-    Selenium模式签到（备用方案）
-    
-    Args:
-        username: 用户名
-        password: 密码
-    
-    Returns:
-        dict: 签到结果
-    """
-    log_info("使用Selenium模式签到...")
-    
-    driver = None
-    
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.common.by import By
-        from selenium.webdriver.support.ui import WebDriverWait
-        from selenium.webdriver.support import expected_conditions as EC
-        from selenium.webdriver.chrome.options import Options
-    except ImportError:
-        log_error("未安装selenium，无法使用Selenium模式")
-        log_error("请安装: pip install selenium")
-        return {
-            'success': False,
-            'message': '缺少selenium依赖',
-            'consecutive_days': 0,
-            'points_earned': 0,
-            'total_points': 0
-        }
-    
-    try:
-        # 配置Chrome选项
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--window-size=1920,1080')
-        chrome_options.add_argument('--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
-        
-        # 尝试不同的chromedriver路径
-        driver = None
-        driver_paths = [
-            '/usr/bin/chromedriver',
-            '/usr/local/bin/chromedriver',
-            '/root/.cache/selenium/chromedriver/linux64/150.0.7891.200/chromedriver',
-        ]
-        
-        for driver_path in driver_paths:
-            if os.path.exists(driver_path):
-                log_debug(f"找到chromedriver: {driver_path}")
-                from selenium.webdriver.chrome.service import Service
-                driver = webdriver.Chrome(service=Service(driver_path), options=chrome_options)
-                break
-        
-        if driver is None:
-            # 尝试自动查找
-            log_debug("尝试自动查找chromedriver...")
-            driver = webdriver.Chrome(options=chrome_options)
-        
-        log_info("浏览器启动成功")
-        
-        # 设置超时
-        wait = WebDriverWait(driver, 30)
-        
-        # 访问论坛登录页
-        log_info("访问论坛登录页...")
-        driver.get(LOGIN_PHP)
-        time.sleep(3)
-        
-        # 输入用户名密码
-        log_info("输入账号密码...")
-        
-        # 等待用户名输入框
-        username_input = wait.until(
-            EC.presence_of_element_located((By.ID, 'Username'))
-        )
-        username_input.clear()
-        username_input.send_keys(username)
-        
-        # 输入密码
-        password_input = driver.find_element(By.ID, 'Password')
-        password_input.clear()
-        password_input.send_keys(password)
-        
-        # 勾选同意条款
-        try:
-            agree_checkbox = driver.find_element(By.ID, 'Agreement')
-            if not agree_checkbox.is_selected():
-                agree_checkbox.click()
-        except:
-            pass
-        
-        # 点击登录按钮
-        log_info("点击登录...")
-        try:
-            submit_btn = driver.find_element(By.XPATH, '//button[contains(text(), "登录")]')
-            submit_btn.click()
-        except:
-            # 尝试按回车
-            from selenium.webdriver.common.keys import Keys
-            password_input.send_keys(Keys.ENTER)
-        
-        time.sleep(5)
-        
-        # 等待登录完成，跳转到论坛
-        log_info("等待登录完成...")
-        for i in range(15):
-            if FORUM_BASE in driver.current_url and 'login' not in driver.current_url.lower():
-                log_info("已跳转到论坛")
-                break
-            time.sleep(2)
-        
-        time.sleep(3)
-        
-        # 访问签到页面
-        log_info("访问签到页面...")
-        driver.get(f'{FORUM_BASE}/mission')
-        time.sleep(5)
-        
-        # 点击签到按钮
-        try:
-            checkin_button = wait.until(
-                EC.element_to_be_clickable((By.XPATH, '//button[contains(text(), "立刻签到") or contains(text(), "立即签到")]'))
-            )
-            log_info("找到签到按钮，点击签到...")
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkin_button)
-            time.sleep(1)
-            checkin_button.click()
-            time.sleep(5)
-        except Exception as e:
-            log_error(f"点击签到按钮失败: {e}")
-        
-        # 刷新页面检查结果
-        driver.refresh()
-        time.sleep(3)
-        
-        page_source = driver.page_source
-        
-        # 解析结果
-        days_match = re.search(r'连续签到[：:]\s*(\d+)\s*天', page_source)
-        total_match = re.search(r'我的积分[：:]\s*(\d+)', page_source)
-        points_match = re.search(r'获得\s*(\d+)\s*积分', page_source)
-        
-        success = '今日未签到' not in page_source and ('今日已签到' in page_source or '已签到' in page_source or points_match)
-        
-        return {
-            'success': success,
-            'message': '签到成功' if success else '签到失败',
-            'consecutive_days': int(days_match.group(1)) if days_match else 0,
-            'points_earned': int(points_match.group(1)) if points_match else 0,
-            'total_points': int(total_match.group(1)) if total_match else 0
-        }
-        
-    except Exception as e:
-        log_error(f"Selenium签到异常: {e}")
-        if DEBUG:
-            import traceback
-            traceback.print_exc()
-        return {
-            'success': False,
-            'message': f'异常: {str(e)}',
-            'consecutive_days': 0,
-            'points_earned': 0,
-            'total_points': 0
-        }
-    finally:
-        if driver:
-            driver.quit()
-
-
 # ==================== 单账号签到入口 ====================
 
 def do_checkin(account, index):
     """
-    执行单个账号的签到
+    执行单个账号的签到（支持失败重试）
     
     Args:
         account: 账号信息字典
@@ -1125,6 +962,8 @@ def do_checkin(account, index):
     Returns:
         dict: 签到结果
     """
+    import time
+    
     username = account['username']
     password = account['password']
     
@@ -1132,39 +971,52 @@ def do_checkin(account, index):
     print(f"  账号{index}: {username}")
     print(f"{'='*50}")
     
-    if RUN_MODE == 'selenium':
-        # 强制使用 Selenium 模式
-        result = checkin_selenium(username, password)
-    elif RUN_MODE == 'api':
-        # 强制使用 API 模式
-        api = ZwCheckinAPI(username, password)
-        if not api.login():
-            log_error("API模式登录失败")
+    # 总共尝试次数 = 1次初始 + RETRY_COUNT次重试
+    max_attempts = RETRY_COUNT + 1
+    result = None
+    
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1:
+            print(f"\n⏳ 第 {attempt} 次尝试（共 {max_attempts} 次）...")
+            log_info(f"第 {attempt}/{max_attempts} 次尝试签到")
+        
+        try:
+            api = ZwCheckinAPI(username, password)
+            
+            if not api.login():
+                log_error(f"登录失败（第{attempt}次）")
+                result = {
+                    'success': False,
+                    'message': '登录失败',
+                    'consecutive_days': 0,
+                    'points_earned': 0,
+                    'total_points': 0
+                }
+            else:
+                result = api.checkin()
+            
+            # 签到成功，跳出重试
+            if result.get('success'):
+                break
+                
+        except Exception as e:
+            log_error(f"签到异常（第{attempt}次）: {e}")
+            if DEBUG:
+                import traceback
+                traceback.print_exc()
             result = {
                 'success': False,
-                'message': 'API登录失败',
+                'message': f'异常: {str(e)}',
                 'consecutive_days': 0,
                 'points_earned': 0,
                 'total_points': 0
             }
-        else:
-            result = api.checkin()
-    else:
-        # auto 模式：先尝试 API，失败再用 Selenium
-        log_info("模式: auto（先尝试API模式）")
         
-        if not HAS_RSA:
-            log_info("未安装pycryptodome，直接使用Selenium模式")
-            result = checkin_selenium(username, password)
-        else:
-            api = ZwCheckinAPI(username, password)
-            
-            if api.login():
-                log_info("API模式登录成功，执行签到...")
-                result = api.checkin()
-            else:
-                log_error("API模式登录失败，尝试Selenium模式...")
-                result = checkin_selenium(username, password)
+        # 如果还有重试机会，等待后重试
+        if attempt < max_attempts:
+            log_info(f"等待 {RETRY_INTERVAL} 秒后重试...")
+            print(f"   等待 {RETRY_INTERVAL} 秒后重试...")
+            time.sleep(RETRY_INTERVAL)
     
     # 输出结果
     if result.get('success'):
@@ -1175,6 +1027,8 @@ def do_checkin(account, index):
     else:
         print(f"\n❌ 签到失败")
         print(f"   原因: {result.get('message', '未知错误')}")
+        if max_attempts > 1:
+            print(f"   已尝试 {max_attempts} 次")
     
     return result
 
@@ -1265,8 +1119,8 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v7.0.0 (青龙面板版)")
-    print(f"#  运行模式: {RUN_MODE}")
+    print(f"#  中望技术社区自动签到 v8.0.0 (青龙面板版)")
+    print(f"#  失败重试: {RETRY_COUNT} 次（间隔 {RETRY_INTERVAL} 秒）")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
     
