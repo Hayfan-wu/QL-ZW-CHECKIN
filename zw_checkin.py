@@ -4,7 +4,7 @@
 @Author       : Hayfan-wu
 @Date         : 2025-06-25
 @Description  : 中望技术社区自动签到脚本（青龙面板版）
-@Version      : 3.4.0
+@Version      : 3.5.0
 
 环境变量:
   ZWSOFT_USERNAME  - 中望社区账号（手机号/邮箱），多账号用换行或&分隔
@@ -25,6 +25,12 @@ cron: 0 0 1 * * *
   2. 多账号格式：每行一个账号，密码与账号按顺序一一对应
   3. 推荐使用 auto 模式，自动尝试 API 模式，失败自动降级到 Selenium
   4. 如果 API 模式不可用，可切换为 selenium 模式（需额外安装依赖）
+
+更新日志 v3.5.0:
+  - 增加token有效性验证，避免使用无效的b2_token
+  - 优先使用access_token验证登录状态
+  - 所有登录方式都经过API验证，确保真的登录成功
+  - 修复"登录成功但签到失败"的问题
 
 更新日志 v3.4.0:
   - 重构登录流程，采用多方案降级策略
@@ -520,14 +526,37 @@ class ZwCheckinAPI:
                 log_debug(f"最终URL: {full_response.url[:100]}...")
                 log_debug(f"当前Cookies: {list(self.session.cookies.keys())}")
                 
-                # 检查是否有b2_token cookie
-                if self.session.cookies.get('b2_token'):
-                    self.b2_token = self.session.cookies.get('b2_token')
-                    log_info("登录成功（获取到 b2_token cookie）")
-                    return True
+                # 检查是否有b2_token cookie，并验证其有效性
+                b2_token_cookie = self.session.cookies.get('b2_token')
+                if b2_token_cookie:
+                    log_debug("检测到b2_token cookie，验证有效性...")
+                    
+                    verify_headers = {
+                        'Authorization': f'Bearer {b2_token_cookie}',
+                        'Content-Type': 'application/json'
+                    }
+                    
+                    verify_response = self.session.post(
+                        USER_MISSION_URL,
+                        headers=verify_headers,
+                        json={},
+                        timeout=30
+                    )
+                    
+                    if verify_response.status_code == 200:
+                        verify_data = verify_response.json()
+                        verify_mission = verify_data.get('mission', {})
+                        if verify_mission.get('current_user', 0) > 0:
+                            log_info("登录成功（b2_token cookie有效）")
+                            self.b2_token = b2_token_cookie
+                            return True
+                        else:
+                            log_debug("b2_token cookie无效，current_user=0")
+                    else:
+                        log_debug(f"b2_token验证失败: HTTP {verify_response.status_code}")
                 
-                # 检查是否已通过cookie登录（调用用户接口测试）
-                log_debug("测试是否已通过cookie登录...")
+                # 检查是否已通过cookie登录（不带Authorization头）
+                log_debug("测试是否已通过session cookie登录...")
                 test_headers = {
                     'Content-Type': 'application/json',
                     'Referer': FORUM_BASE + '/'
@@ -540,7 +569,7 @@ class ZwCheckinAPI:
                     timeout=30
                 )
                 
-                log_debug(f"测试接口响应: {test_response.status_code}")
+                log_debug(f"cookie模式测试响应: {test_response.status_code}")
                 
                 if test_response.status_code == 200:
                     test_data = test_response.json()
@@ -550,7 +579,7 @@ class ZwCheckinAPI:
                         self.b2_token = '__cookie_mode__'
                         return True
                 
-                log_debug("方案A失败，尝试方案B...")
+                log_debug("方案A失败，尝试方案C...")
                 
                 # 方案B：手动跟踪重定向，在论坛callback页面前提取code
                 log_debug("方案B：手动跟踪重定向，尝试提取授权码...")
@@ -717,7 +746,7 @@ class ZwCheckinAPI:
     
     def _exchange_token(self, code):
         """
-        用授权码换取 access token，并获取论坛 b2_token
+        用授权码换取 access token，并验证登录有效性
         
         Args:
             code: 授权码
@@ -749,63 +778,90 @@ class ZwCheckinAPI:
                 access_token = token_result.get('access_token', '')
                 log_debug(f"Token响应: access_token={access_token[:20]}...")
                 
-                # 先检查当前是否已有b2_token cookie
-                b2_token_cookie = self.session.cookies.get('b2_token')
+                if not access_token:
+                    log_error("换取Token失败：未获取到access_token")
+                    return False
                 
-                if b2_token_cookie:
-                    self.b2_token = b2_token_cookie
-                    log_info("登录成功（获取到 b2_token）")
-                    log_debug(f"b2_token: {self.b2_token[:20]}...")
-                    return True
+                # 方法1（优先）：用 access_token 直接调用论坛API验证
+                log_debug("验证access_token是否可用于论坛API...")
                 
-                # 尝试手动访问回调页面来设置 cookie
-                log_debug("未找到 b2_token cookie，尝试手动访问回调页面...")
+                test_headers = {
+                    'Authorization': f'Bearer {access_token}',
+                    'Content-Type': 'application/json'
+                }
                 
-                # 方法1: 访问带code和state的回调URL
+                test_response = self.session.post(
+                    USER_MISSION_URL,
+                    headers=test_headers,
+                    json={},
+                    timeout=30
+                )
+                
+                log_debug(f"access_token测试响应: {test_response.status_code}")
+                
+                if test_response.status_code == 200:
+                    test_data = test_response.json()
+                    mission = test_data.get('mission', {})
+                    if mission.get('current_user', 0) > 0:
+                        log_info("登录成功（access_token可直接用于论坛API）")
+                        self.b2_token = access_token
+                        return True
+                
+                log_debug("access_token不可直接用，尝试获取b2_token cookie...")
+                
+                # 方法2：访问回调页面获取b2_token cookie，然后验证
                 callback_url = f'{LOGIN_CALLBACK}?code={code}&state={self.state}'
                 callback_response = self.session.get(callback_url, allow_redirects=True, timeout=30)
                 
                 b2_token_cookie = self.session.cookies.get('b2_token')
                 if b2_token_cookie:
-                    self.b2_token = b2_token_cookie
-                    log_info("登录成功（获取到 b2_token）")
-                    return True
-                
-                log_debug(f"方法1失败，当前cookies: {list(self.session.cookies.keys())}")
-                
-                # 方法2: 尝试用 access_token 调用论坛接口
-                if access_token:
-                    log_debug("尝试用 access_token 获取用户信息...")
+                    log_debug(f"获取到b2_token cookie，验证有效性...")
                     
-                    # 尝试用 access_token 访问论坛的用户接口
-                    test_headers = {
-                        'Authorization': f'Bearer {access_token}',
+                    # 验证b2_token是否有效
+                    verify_headers = {
+                        'Authorization': f'Bearer {b2_token_cookie}',
                         'Content-Type': 'application/json'
                     }
                     
-                    # 尝试获取用户信息
-                    test_response = self.session.post(
+                    verify_response = self.session.post(
                         USER_MISSION_URL,
-                        headers=test_headers,
+                        headers=verify_headers,
                         json={},
                         timeout=30
                     )
                     
-                    log_debug(f"测试访问响应: {test_response.status_code}")
-                    
-                    # 如果返回200，说明access_token可以直接用
-                    if test_response.status_code == 200:
-                        # 检查返回的数据是否有效
-                        test_data = test_response.json()
-                        mission = test_data.get('mission', {})
-                        if mission.get('current_user', 0) > 0:
-                            log_info("登录成功（access_token可直接用于API）")
-                            # 保存 access_token 作为 b2_token 使用
-                            self.b2_token = access_token
+                    if verify_response.status_code == 200:
+                        verify_data = verify_response.json()
+                        verify_mission = verify_data.get('mission', {})
+                        if verify_mission.get('current_user', 0) > 0:
+                            log_info("登录成功（b2_token cookie有效）")
+                            self.b2_token = b2_token_cookie
                             return True
+                        else:
+                            log_debug("b2_token cookie无效，current_user=0")
+                    else:
+                        log_debug(f"b2_token验证失败: HTTP {verify_response.status_code}")
+                else:
+                    log_debug(f"未获取到b2_token cookie，当前cookies: {list(self.session.cookies.keys())}")
                 
-                log_error("登录失败：未获取到 b2_token")
-                log_debug(f"所有cookies: {list(self.session.cookies.keys())}")
+                # 方法3：用cookie模式试试（session cookie登录）
+                log_debug("尝试cookie模式登录...")
+                cookie_test = self.session.post(
+                    USER_MISSION_URL,
+                    headers={'Content-Type': 'application/json', 'Referer': FORUM_BASE + '/'},
+                    json={},
+                    timeout=30
+                )
+                
+                if cookie_test.status_code == 200:
+                    cookie_data = cookie_test.json()
+                    cookie_mission = cookie_data.get('mission', {})
+                    if cookie_mission.get('current_user', 0) > 0:
+                        log_info("登录成功（cookie模式）")
+                        self.b2_token = '__cookie_mode__'
+                        return True
+                
+                log_error("登录失败：所有token验证均未通过")
                 return False
             else:
                 log_error(f"换取Token失败: {token_response.status_code}")
@@ -1319,7 +1375,7 @@ def main():
     start_time = datetime.now()
     
     print(f"\n{'#'*50}")
-    print(f"#  中望技术社区自动签到 v3.4.0 (青龙面板版)")
+    print(f"#  中望技术社区自动签到 v3.5.0 (青龙面板版)")
     print(f"#  运行模式: {RUN_MODE}")
     print(f"#  执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"{'#'*50}")
